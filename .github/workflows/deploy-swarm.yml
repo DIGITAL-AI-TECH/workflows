@@ -1,0 +1,201 @@
+name: Deploy to Swarm
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Nome da aplicação (usado para nomear a imagem no registry)"
+        required: true
+        type: string
+      stack_name:
+        description: "Nome do stack no Docker Swarm"
+        required: true
+        type: string
+      service_name:
+        description: "Nome do service dentro do stack (sem prefixo do stack)"
+        required: true
+        type: string
+      port:
+        description: "Porta interna do container"
+        required: false
+        type: string
+        default: "3000"
+      dockerfile:
+        description: "Path do Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+      deploy_config:
+        description: "Path do deploy-config.yml"
+        required: false
+        type: string
+        default: "deploy-config.yml"
+      server_ip:
+        description: "IP do servidor de produção"
+        required: false
+        type: string
+        default: "154.38.167.74"
+    secrets:
+      REGISTRY_USER:
+        required: true
+      REGISTRY_PASSWORD:
+        required: true
+      CF_API_TOKEN:
+        required: true
+      CF_ZONE_ID:
+        required: true
+
+jobs:
+  build-push:
+    name: Build & Push Image
+    runs-on: [self-hosted, swarm]
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login no Registry
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | \
+          docker login registry.digital-ai.tech \
+          -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Build & Push
+        id: build
+        run: |
+          IMAGE="registry.digital-ai.tech/digital-ai/${{ inputs.app_name }}"
+          SHA_TAG="${{ github.sha }}"
+          docker build -f "${{ inputs.dockerfile }}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${SHA_TAG}" .
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${SHA_TAG}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
+
+  dns-sync:
+    name: Sync DNS (Cloudflare)
+    needs: [build-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync A Records no Cloudflare
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          SERVER_IP: ${{ inputs.server_ip }}
+        run: |
+          # Lê domínios do deploy-config.yml
+          DOMAINS=$(python3 -c "
+          import yaml, sys
+          with open('${{ inputs.deploy_config }}') as f:
+              cfg = yaml.safe_load(f)
+          for d in cfg.get('domains', []):
+              print(d)
+          ")
+
+          if [ -z "$DOMAINS" ]; then
+            echo "Nenhum domínio encontrado em ${{ inputs.deploy_config }}, pulando DNS sync."
+            exit 0
+          fi
+
+          for DOMAIN in $DOMAINS; do
+            echo "--- Sincronizando: $DOMAIN ---"
+
+            EXISTING=$(curl -s \
+              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=A&name=${DOMAIN}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json")
+
+            RECORD_ID=$(echo "$EXISTING" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null || true)
+            CURRENT_IP=$(echo "$EXISTING" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result'][0]['content'] if d.get('result') else '')" 2>/dev/null || true)
+
+            if [ -n "$RECORD_ID" ] && [ "$CURRENT_IP" = "$SERVER_IP" ]; then
+              echo "  -> Já correto (${SERVER_IP}), nenhuma ação necessária."
+            elif [ -n "$RECORD_ID" ]; then
+              RESULT=$(curl -s -X PATCH \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"content\":\"${SERVER_IP}\",\"proxied\":false,\"ttl\":60}")
+              echo "  -> Atualizado para ${SERVER_IP} (DNS Only)"
+            else
+              RESULT=$(curl -s -X POST \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${SERVER_IP}\",\"ttl\":60,\"proxied\":false}")
+              echo "  -> Criado: ${DOMAIN} → ${SERVER_IP} (DNS Only)"
+            fi
+          done
+
+          echo "DNS sync concluído. Aguardando propagação (15s)..."
+          sleep 15
+
+  deploy:
+    name: Deploy no Swarm
+    needs: [build-push, dns-sync]
+    runs-on: [self-hosted, swarm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login no Registry
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | \
+          docker login registry.digital-ai.tech \
+          -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Deploy Stack
+        env:
+          IMAGE: ${{ needs.build-push.outputs.image }}
+          SHA_TAG: ${{ needs.build-push.outputs.sha_tag }}
+          STACK: ${{ inputs.stack_name }}
+          SERVICE: ${{ inputs.service_name }}
+        run: |
+          # Verifica se é primeiro deploy ou update
+          if docker stack ls --format '{{.Name}}' | grep -q "^${STACK}$"; then
+            echo "Stack ${STACK} existe — atualizando serviço..."
+            docker service update \
+              --image "${IMAGE}:${SHA_TAG}" \
+              --with-registry-auth \
+              "${STACK}_${SERVICE}"
+          else
+            echo "Stack ${STACK} não existe — primeiro deploy..."
+            docker stack deploy \
+              --with-registry-auth \
+              --prune \
+              -c docker-stack.yml \
+              "${STACK}"
+          fi
+
+      - name: Health Check
+        env:
+          STACK: ${{ inputs.stack_name }}
+          SERVICE: ${{ inputs.service_name }}
+        run: |
+          echo "Aguardando convergência do serviço..."
+          MAX_WAIT=120
+          INTERVAL=5
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATE=$(docker service ps "${STACK}_${SERVICE}" \
+              --filter "desired-state=running" \
+              --format "{{.CurrentState}}" | head -1)
+            echo "  Estado: $STATE (${ELAPSED}s)"
+            if [[ "$STATE" == Running* ]]; then
+              echo "✅ Deploy concluído com sucesso — $(date)"
+              exit 0
+            fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "❌ Timeout — serviço não convergiu. Logs:"
+          docker service logs "${STACK}_${SERVICE}" --tail 50
+          exit 1

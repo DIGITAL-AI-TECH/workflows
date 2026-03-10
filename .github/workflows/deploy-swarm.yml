@@ -35,6 +35,11 @@ on:
         required: false
         type: string
         default: "vps.digital-ai.tech"
+      notify_url:
+        description: "URL do webhook n8n para notificações de deploy"
+        required: false
+        type: string
+        default: "https://webhook.digital-ai.tech/webhook/deploy-notify"
     secrets:
       REGISTRY_USER:
         required: true
@@ -53,6 +58,25 @@ jobs:
       image: ${{ steps.build.outputs.image }}
       sha_tag: ${{ steps.build.outputs.sha_tag }}
     steps:
+      - name: Notify — Deploy Iniciado
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'started','repo':os.environ['REPO'],
+              'branch':os.environ['BRANCH'],'actor':os.environ['ACTOR'],
+              'commit_sha':os.environ['SHA'],'commit_message':os.environ['COMMIT_MSG'],
+              'run_url':os.environ['RUN_URL']
+            }))")" || true
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -74,6 +98,48 @@ jobs:
           docker push "${IMAGE}:${SHA_TAG}"
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Notify — Build Concluido
+        if: success()
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'info','stage':'Build & Push',
+              'message':'Imagem publicada no registry com sucesso',
+              'repo':os.environ['REPO'],'branch':os.environ['BRANCH'],
+              'actor':os.environ['ACTOR'],'commit_sha':os.environ['SHA'],
+              'run_url':os.environ['RUN_URL']
+            }))")" || true
+
+      - name: Notify — Build Falhou
+        if: failure()
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'failure','stage':'Build & Push',
+              'message':'Falha no build ou push da imagem Docker.',
+              'repo':os.environ['REPO'],'branch':os.environ['BRANCH'],
+              'actor':os.environ['ACTOR'],'commit_sha':os.environ['SHA'],
+              'commit_message':os.environ['COMMIT_MSG'],
+              'run_url':os.environ['RUN_URL']
+            }))")" || true
 
   dns-sync:
     name: Sync DNS (Cloudflare)
@@ -135,6 +201,42 @@ jobs:
           echo "DNS sync concluído. Aguardando propagação (15s)..."
           sleep 15
 
+      - name: Notify — DNS Sincronizado
+        if: success()
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'info','stage':'DNS Sync',
+              'message':'CNAME sincronizado na Cloudflare com sucesso',
+              'repo':os.environ['REPO'],'branch':os.environ['BRANCH'],
+              'actor':os.environ['ACTOR'],'run_url':os.environ['RUN_URL']
+            }))")" || true
+
+      - name: Notify — DNS Falhou
+        if: failure()
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'failure','stage':'DNS Sync',
+              'message':'Falha ao sincronizar CNAME na Cloudflare.',
+              'repo':os.environ['REPO'],'branch':os.environ['BRANCH'],
+              'actor':os.environ['ACTOR'],'run_url':os.environ['RUN_URL']
+            }))")" || true
+
   deploy:
     name: Deploy no Swarm
     needs: [build-push, dns-sync]
@@ -150,18 +252,19 @@ jobs:
           -u "${{ secrets.REGISTRY_USER }}" --password-stdin
 
       - name: Deploy Stack
+        id: deploy
         env:
           IMAGE: ${{ needs.build-push.outputs.image }}
           SHA_TAG: ${{ needs.build-push.outputs.sha_tag }}
           STACK: ${{ inputs.stack_name }}
-          SERVICE: ${{ inputs.service_name }}
+          SERVICE: ${{ inputs.stack_name }}_${{ inputs.service_name }}
         run: |
-          if docker stack ls --format '{{.Name}}'] | grep -q "^${STACK}$"; then
+          if docker stack ls --format '{{.Name}}' | grep -q "^${STACK}$"; then
             echo "Stack ${STACK} existe — atualizando serviço..."
             docker service update \
               --image "${IMAGE}:${SHA_TAG}" \
               --with-registry-auth \
-              "${STACK}_${SERVICE}"
+              "${SERVICE}"
           else
             echo "Stack ${STACK} não existe — primeiro deploy..."
             docker stack deploy \
@@ -173,24 +276,65 @@ jobs:
 
       - name: Health Check
         env:
-          STACK: ${{ inputs.stack_name }}
-          SERVICE: ${{ inputs.service_name }}
+          SERVICE: ${{ inputs.stack_name }}_${{ inputs.service_name }}
         run: |
           MAX_WAIT=120
           ELAPSED=0
           while [ $ELAPSED -lt $MAX_WAIT ]; do
-            STATE=$(docker service ps "${STACK}_${SERVICE}" \
+            STATE=$(docker service ps "${SERVICE}" \
               --filter "desired-state=running" \
               --format "{{.CurrentState}}" | head -1)
             echo "  Estado: $STATE (${ELAPSED}s)"
             if [[ "$STATE" == Running* ]]; then
-              echo "✅ Deploy concluído com sucesso — $(date)"
+              echo "Deploy OK — $(date)"
               exit 0
             fi
             sleep 5
             ELAPSED=$((ELAPSED + 5))
           done
-          echo "❌ Timeout — serviço não convergiu. Logs:"
-          docker service logs "${STACK}_${SERVICE}" --tail 50
+          echo "Timeout — verificando logs..."
+          docker service logs "${SERVICE}" --tail 50
           exit 1
 
+      - name: Notify — Deploy Concluido com Sucesso
+        if: success()
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'success','repo':os.environ['REPO'],
+              'branch':os.environ['BRANCH'],'actor':os.environ['ACTOR'],
+              'commit_sha':os.environ['SHA'],'commit_message':os.environ['COMMIT_MSG'],
+              'run_url':os.environ['RUN_URL'],
+              'message':os.environ['REPO']+'.digital-ai.tech atualizado e saudavel'
+            }))")" || true
+
+      - name: Notify — Deploy Falhou
+        if: failure()
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          N8N_URL: ${{ inputs.notify_url }}
+          REPO: ${{ inputs.app_name }}
+        run: |
+          curl -sf -X POST "${N8N_URL}" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os; print(json.dumps({
+              'status':'failure','stage':'Deploy',
+              'message':'Falha no deploy do Swarm ou health check.',
+              'repo':os.environ['REPO'],'branch':os.environ['BRANCH'],
+              'actor':os.environ['ACTOR'],'commit_sha':os.environ['SHA'],
+              'commit_message':os.environ['COMMIT_MSG'],
+              'run_url':os.environ['RUN_URL']
+            }))")" || true

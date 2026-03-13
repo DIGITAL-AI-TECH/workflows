@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: "https://webhook.digital-ai.tech/webhook/1c708636-864f-469d-8540-0dab5c145c7c"
+      stack_env:
+        description: "Variáveis de ambiente para o stack (KEY=VALUE, uma por linha)"
+        required: false
+        type: string
+        default: ""
     secrets:
       REGISTRY_USER:
         required: true
@@ -258,21 +263,22 @@ jobs:
           SHA_TAG: ${{ needs.build-push.outputs.sha_tag }}
           STACK: ${{ inputs.stack_name }}
           SERVICE: ${{ inputs.stack_name }}_${{ inputs.service_name }}
+          STACK_ENV: ${{ inputs.stack_env }}
         run: |
-          if docker stack ls --format '{{.Name}}' | grep -q "^${STACK}$"; then
-            echo "Stack ${STACK} existe — atualizando serviço..."
-            docker service update \
-              --image "${IMAGE}:${SHA_TAG}" \
-              --with-registry-auth \
-              "${SERVICE}"
-          else
-            echo "Stack ${STACK} não existe — primeiro deploy..."
-            docker stack deploy \
-              --with-registry-auth \
-              --prune \
-              -c docker-stack.yml \
-              "${STACK}"
+          # Export stack-specific env vars
+          if [ -n "${STACK_ENV}" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && export "$line"
+            done <<< "${STACK_ENV}"
           fi
+          # Set image tag for docker-stack.yml substitution
+          export IMAGE_TAG="${SHA_TAG}"
+          echo "Deploying stack ${STACK} with image ${IMAGE}:${SHA_TAG}..."
+          docker stack deploy \
+            --with-registry-auth \
+            --prune \
+            -c docker-stack.yml \
+            "${STACK}"
 
       - name: Health Check
         env:
@@ -338,4 +344,5 @@ jobs:
               'commit_message':os.environ['COMMIT_MSG'],
               'run_url':os.environ['RUN_URL']
             }))")" || true
+
 

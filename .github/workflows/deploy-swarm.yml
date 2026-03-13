@@ -39,7 +39,7 @@ on:
         description: "URL do webhook n8n para notificações de deploy"
         required: false
         type: string
-        default: "https://webhook.digital-ai.tech/webhook/deploy-notify"
+        default: "https://webhook.digital-ai.tech/webhook/1c708636-864f-469d-8540-0dab5c145c7c"
     secrets:
       REGISTRY_USER:
         required: true

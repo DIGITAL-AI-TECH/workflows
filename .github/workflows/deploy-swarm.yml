@@ -254,7 +254,7 @@ jobs:
       - name: Deploy Stack
         id: deploy
         env:
-          IMAGE: ${{ needs.build-push.outputs.image }}
+          IMAGE: registry.digital-ai.tech/digital-ai/${{ inputs.app_name }}
           SHA_TAG: ${{ needs.build-push.outputs.sha_tag }}
           STACK: ${{ inputs.stack_name }}
           SERVICE: ${{ inputs.stack_name }}_${{ inputs.service_name }}
@@ -338,3 +338,4 @@ jobs:
               'commit_message':os.environ['COMMIT_MSG'],
               'run_url':os.environ['RUN_URL']
             }))")" || true
+

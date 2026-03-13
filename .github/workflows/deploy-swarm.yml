@@ -40,11 +40,6 @@ on:
         required: false
         type: string
         default: "https://webhook.digital-ai.tech/webhook/1c708636-864f-469d-8540-0dab5c145c7c"
-      stack_env:
-        description: "Variáveis de ambiente para o stack (KEY=VALUE, uma por linha)"
-        required: false
-        type: string
-        default: ""
     secrets:
       REGISTRY_USER:
         required: true
@@ -54,6 +49,14 @@ on:
         required: true
       CF_ZONE_ID:
         required: true
+      APP_DATABASE_URL:
+        required: false
+      APP_NEXTAUTH_SECRET:
+        required: false
+      APP_ADMIN_EMAIL:
+        required: false
+      APP_ADMIN_PASSWORD:
+        required: false
 
 jobs:
   build-push:
@@ -263,14 +266,16 @@ jobs:
           SHA_TAG: ${{ needs.build-push.outputs.sha_tag }}
           STACK: ${{ inputs.stack_name }}
           SERVICE: ${{ inputs.stack_name }}_${{ inputs.service_name }}
-          STACK_ENV: ${{ inputs.stack_env }}
+          APP_DATABASE_URL: ${{ secrets.APP_DATABASE_URL }}
+          APP_NEXTAUTH_SECRET: ${{ secrets.APP_NEXTAUTH_SECRET }}
+          APP_ADMIN_EMAIL: ${{ secrets.APP_ADMIN_EMAIL }}
+          APP_ADMIN_PASSWORD: ${{ secrets.APP_ADMIN_PASSWORD }}
         run: |
-          # Export stack-specific env vars
-          if [ -n "${STACK_ENV}" ]; then
-            while IFS= read -r line; do
-              [ -n "$line" ] && export "$line"
-            done <<< "${STACK_ENV}"
-          fi
+          # Export app env vars from secrets (if provided)
+          [ -n "${APP_DATABASE_URL:-}" ] && export DATABASE_URL="${APP_DATABASE_URL}"
+          [ -n "${APP_NEXTAUTH_SECRET:-}" ] && export NEXTAUTH_SECRET="${APP_NEXTAUTH_SECRET}"
+          [ -n "${APP_ADMIN_EMAIL:-}" ] && export ADMIN_EMAIL="${APP_ADMIN_EMAIL}"
+          [ -n "${APP_ADMIN_PASSWORD:-}" ] && export ADMIN_PASSWORD="${APP_ADMIN_PASSWORD}"
           # Set image tag for docker-stack.yml substitution
           export IMAGE_TAG="${SHA_TAG}"
           echo "Deploying stack ${STACK} with image ${IMAGE}:${SHA_TAG}..."
@@ -344,5 +349,6 @@ jobs:
               'commit_message':os.environ['COMMIT_MSG'],
               'run_url':os.environ['RUN_URL']
             }))")" || true
+
 
 
